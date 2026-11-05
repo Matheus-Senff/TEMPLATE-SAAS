@@ -83,9 +83,9 @@ if (tsc.status !== 0) {
   console.error("\ndatabase.types.ts não corresponde ao banco gerado pelas migrações (veja os nomes acima).");
   if (process.env.CI) {
     // No Docker locally? Copy the file below into src/lib/supabase/database.types.ts.
-    console.log("\n----- BEGIN GENERATED database.types.ts -----");
-    console.log(readFileSync(generatedPath, "utf8"));
-    console.log("----- END GENERATED database.types.ts -----");
+    console.info("\n----- BEGIN GENERATED database.types.ts -----");
+    console.info(readFileSync(generatedPath, "utf8"));
+    console.info("----- END GENERATED database.types.ts -----");
   }
   process.exit(1);
 }
