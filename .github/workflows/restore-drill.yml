@@ -1,0 +1,88 @@
+name: Teste de restauração do backup
+
+# Weekly proof that the backups restore: downloads the latest successful backup.yml artifacts, restores the dump
+# into a THROWAWAY database on a local Supabase Postgres (`supabase db start`, inside this runner; production is
+# never touched), then compares row counts per table with the counts recorded at backup time and the number of
+# Storage files with storage.objects. Any restore error or mismatch fails the run (GitHub e-mails the failure).
+# Secret (environment "production"): BACKUP_PASSPHRASE.
+
+on:
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    env:
+      BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+      GH_TOKEN: ${{ github.token }}
+      SUPABASE_AUTH_CAPTCHA_SECRET: 1x0000000000000000000000000000000AA
+      ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+      DRILL_URL: postgresql://postgres:postgres@127.0.0.1:54322/restore_drill
+    steps:
+      - name: Fail loudly without the passphrase
+        run: |
+          if [ -z "$BACKUP_PASSPHRASE" ]; then echo "::error::BACKUP_PASSPHRASE not set: backups cannot be verified."; exit 1; fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Download the latest successful backup
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow backup.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ]; then echo "::error::No successful backup run found."; exit 1; fi
+          echo "Backup run: $run_id"
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --dir drill
+          ls -R drill
+      - name: Decrypt
+        run: |
+          set -euo pipefail
+          mkdir -p restore
+          gpg --batch --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" -d drill/backup-*/backup.tar.gpg | tar -C restore -xf -
+          if ls drill/storage-*/storage.tar.gpg > /dev/null 2>&1; then
+            mkdir -p restore/storage
+            gpg --batch --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" -d drill/storage-*/storage.tar.gpg | tar -C restore/storage -xf -
+          fi
+      - name: Install PostgreSQL client 18
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-18
+      - name: Start a throwaway Supabase Postgres
+        run: npx supabase db start
+      - name: Restore into an empty database (--no-owner --no-privileges)
+        run: |
+          set -euo pipefail
+          bin=/usr/lib/postgresql/18/bin
+          $bin/psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "create database restore_drill template template0"
+          # What the dumped schemas expect from a Supabase database but is not part of the dump itself.
+          $bin/psql "$DRILL_URL" -v ON_ERROR_STOP=1 -c "
+            create schema extensions;
+            create extension if not exists pgcrypto with schema extensions;
+            create extension if not exists \"uuid-ossp\" with schema extensions;
+            create publication supabase_realtime;"
+          set +e
+          $bin/pg_restore --no-owner --no-privileges --dbname "$DRILL_URL" restore/backup.dump 2> restore.log
+          set -e
+          if grep -q "error:" restore.log; then
+            echo "::error::pg_restore reported errors (see below). Fix the restore procedure before you need it."
+            cat restore.log
+            exit 1
+          fi
+      - name: Sanity checks (row counts and Storage files)
+        run: node scripts/restore-drill-check.mjs restore/counts.json restore/storage
+        env:
+          RESTORE_DB_URL: ${{ env.DRILL_URL }}
+      - if: always()
+        run: npx supabase stop --no-backup || true

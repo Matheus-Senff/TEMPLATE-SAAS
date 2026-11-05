@@ -1,0 +1,3 @@
+-- Local development data (`npm run db:reset` runs migrations + this file). Never runs in production.
+-- Create users through the app (sign-up) or Supabase Studio > Authentication; then promote one to admin:
+-- update public.profiles set role = 'admin' where email = 'voce@exemplo.com';

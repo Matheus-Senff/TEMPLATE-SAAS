@@ -1,0 +1,13 @@
+# LF everywhere (Prettier, shell scripts and CI expect it), regardless of core.autocrlf on Windows.
+* text=auto eol=lf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.glb binary

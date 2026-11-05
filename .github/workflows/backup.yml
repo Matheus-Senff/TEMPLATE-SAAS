@@ -1,0 +1,94 @@
+name: Backup do banco e dos arquivos (Supabase)
+
+# Supabase Pro already keeps daily backups (7 days). This adds an off-site, encrypted copy as GitHub artifacts
+# (kept 30 days), checked weekly by restore-drill.yml:
+#   backup-<run>   database (public, auth, storage schemas) + row counts, tar + GPG (AES256)
+#   storage-<run>  every Storage bucket, synced through Supabase's S3-compatible endpoint, tar + GPG
+# Secrets (environment "production"):
+#   SUPABASE_DB_URL (Session pooler URI, port 5432), BACKUP_PASSPHRASE
+#   optional, for files: SUPABASE_S3_ENDPOINT (https://<ref>.supabase.co/storage/v1/s3), SUPABASE_S3_REGION,
+#   SUPABASE_S3_ACCESS_KEY_ID, SUPABASE_S3_SECRET_ACCESS_KEY (Storage > Settings > S3 access keys)
+# Restore: README "Backup e restauração" -- ALWAYS into a new project/local database, never over production.
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+      S3_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+      AWS_DEFAULT_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Skip when secrets are missing
+        id: guard
+        run: |
+          if [ -z "$SUPABASE_DB_URL" ] || [ -z "$BACKUP_PASSPHRASE" ]; then
+            echo "Backup secrets not set: skipping."; echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$S3_ENDPOINT" ] && [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "storage=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Storage S3 secrets not set: files are not backed up."
+          fi
+      - name: Install PostgreSQL client 18
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-18
+      - name: Dump, count rows, verify and encrypt
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          bin=/usr/lib/postgresql/18/bin
+          mkdir -p out
+          $bin/pg_dump --format=custom --no-owner --no-privileges --schema=public --schema=auth --schema=storage "$SUPABASE_DB_URL" -f out/backup.dump
+          $bin/pg_restore --list out/backup.dump > /dev/null
+          # Row counts right after the dump: the restore drill compares them with the restored database.
+          $bin/psql "$SUPABASE_DB_URL" -At -v ON_ERROR_STOP=1 -c "
+            select json_object_agg(t.name, (xpath('/row/c/text()',
+              query_to_xml(format('select count(*) as c from %I.%I', t.s, t.n), false, true, '')))[1]::text::bigint)
+            from (
+              select table_schema as s, table_name as n, table_schema || '.' || table_name as name
+              from information_schema.tables where table_schema = 'public' and table_type = 'BASE TABLE'
+              union all select 'auth', 'users', 'auth.users'
+              union all select 'storage', 'objects', 'storage.objects'
+            ) t" > out/counts.json
+          cat out/counts.json
+          tar -C out -cf - backup.dump counts.json | gpg --batch --yes --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" --symmetric --cipher-algo AES256 -o backup.tar.gpg
+          rm -rf out
+      - if: steps.guard.outputs.skip != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backup-${{ github.run_id }}
+          path: backup.tar.gpg
+          retention-days: 30
+      - name: Sync Storage buckets (S3-compatible endpoint) and encrypt
+        if: steps.guard.outputs.skip != 'true' && steps.guard.outputs.storage == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p storage
+          for bucket in $(aws s3api list-buckets --endpoint-url "$S3_ENDPOINT" --query 'Buckets[].Name' --output text); do
+            aws s3 sync "s3://$bucket" "storage/$bucket" --endpoint-url "$S3_ENDPOINT" --only-show-errors
+          done
+          find storage -type f | wc -l | xargs echo "files:"
+          tar -C storage -cf - . | gpg --batch --yes --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" --symmetric --cipher-algo AES256 -o storage.tar.gpg
+          rm -rf storage
+      - if: steps.guard.outputs.skip != 'true' && steps.guard.outputs.storage == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: storage-${{ github.run_id }}
+          path: storage.tar.gpg
+          retention-days: 30

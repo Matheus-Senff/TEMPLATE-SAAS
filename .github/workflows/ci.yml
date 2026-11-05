@@ -1,0 +1,158 @@
+name: CI/CD
+
+# CI: lint, format, types, unit/RLS tests (PGlite), build, HTTP E2E, and a job on a REAL local Supabase stack
+# (all migrations from scratch, SQL lint, generated types vs the committed file, RLS tests on real Postgres,
+# authenticated E2E). No secrets are needed for any of it.
+# CD: Vercel deploys through its Git integration. Production migrations run INSIDE the Vercel production build
+# (`npm run build` -> scripts/build.mjs, before `next build`): if they fail, the deploy fails and the previous
+# version keeps serving. Migrations still must be expand/contract: the old code serves until the new one is live.
+# The "migrate" job below is only a manual fallback (Actions > CI/CD > Run workflow).
+#
+# Third-party actions are pinned to a full commit SHA (the tag is in the comment): a moved or compromised tag
+# cannot change what runs here. Dependabot (github-actions) keeps SHA and comment up to date.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      migrate:
+        description: "Aplicar as migrações no banco de produção (fallback manual do build da Vercel)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs only: a run on main is never interrupted halfway.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  check:
+    name: Lint, test, build
+    runs-on: ubuntu-latest
+    env:
+      # Placeholders: the build only needs well-formed values (no secrets in this job).
+      NEXT_PUBLIC_SUPABASE_URL: https://ci.supabase.co
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci
+      SUPABASE_SECRET_KEY: sb_secret_ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Production dependencies (high/critical)
+        run: npm audit --omit=dev --audit-level=high
+
+  e2e:
+    name: E2E HTTP (Playwright)
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: https://ci.supabase.co
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci
+      SUPABASE_SECRET_KEY: sb_secret_ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npm run test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report-http
+          path: playwright-report
+          retention-days: 7
+
+  database:
+    name: Banco real (Supabase local) + E2E autenticado
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Cloudflare's PUBLIC Turnstile test keys (always pass): captcha stays on, like production.
+      SUPABASE_AUTH_CAPTCHA_SECRET: 1x0000000000000000000000000000000AA
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+      TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      CRON_SECRET: ci-cron-secret-0123456789abcdef
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Start Supabase (Docker)
+        run: npx supabase start -x studio,imgproxy,edge-runtime,logflare,vector,supavisor
+      - name: Reset (every migration from scratch + seed)
+        run: npx supabase db reset
+      - name: SQL lint (plpgsql_check)
+        run: npx supabase db lint --level warning --fail-on error
+      - name: Export the local stack env
+        run: node scripts/ci-local-env.mjs
+      - name: Generated types match database.types.ts
+        run: npm run db:types:check
+      - name: RLS tests on real Postgres
+        run: npm run test:rls:real
+      - run: npx playwright install --with-deps chromium
+      - name: Build against the local stack
+        run: npm run build
+      - name: E2E (account journey + public pages)
+        run: npx playwright test --project=desktop
+        env:
+          E2E_SUPABASE_URL: ${{ env.NEXT_PUBLIC_SUPABASE_URL }}
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report-database
+          path: playwright-report
+          retention-days: 7
+      - if: always()
+        run: npx supabase stop --no-backup || true
+
+  migrate:
+    name: Migrações em produção (fallback manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.migrate
+    needs: [check, database]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      SUPABASE_DB_PUSH_CONFIRM: sim
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: supabase db push (production)
+        run: npm run db:push

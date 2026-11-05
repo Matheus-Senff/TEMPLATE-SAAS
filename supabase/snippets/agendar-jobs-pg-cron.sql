@@ -1,0 +1,25 @@
+-- OPTIONAL: process public.jobs every minute with pg_cron + pg_net (Vercel Hobby cron runs only once a day).
+-- Not a migration on purpose (it needs your site URL and a secret). To enable:
+--   1. Supabase > Database > Extensions: enable pg_cron and pg_net (or `create extension` below).
+--   2. Store CRON_SECRET in Vault (same value as in Vercel), once, in the SQL editor:
+--        select vault.create_secret('<CRON_SECRET>', 'cron_secret');
+--   3. Copy the block below into a NEW migration (npm run db:new agendar_jobs), replace <SITE_URL>, deploy.
+-- Remove: select cron.unschedule('process-jobs');
+
+-- create extension if not exists pg_cron with schema pg_catalog;
+-- create extension if not exists pg_net with schema extensions;
+--
+-- select cron.schedule(
+--   'process-jobs',
+--   '* * * * *',
+--   $$
+--   select net.http_get(
+--     url := '<SITE_URL>/api/cron/jobs',
+--     headers := jsonb_build_object(
+--       'Authorization',
+--       'Bearer ' || (select decrypted_secret from vault.decrypted_secrets where name = 'cron_secret')
+--     ),
+--     timeout_milliseconds := 55000
+--   );
+--   $$
+-- );
